@@ -75,7 +75,7 @@ class LeilaoView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         
-    @ui.button(label="Adicionar Chave", style=ui.ButtonStyle.green, custom_id="add_key")
+    @ui.button(label="Adicionar Chave", style=discord.ButtonStyle.green, custom_id="add_key")
     async def add_key(self, interaction: discord.Interaction, button: ui.Button):
         modal = AdicionarChaveModal()
         await interaction.response.send_modal(modal)
@@ -109,7 +109,7 @@ class FormularioLeilaoView(ui.View):
         super().__init__()
         self.chave_info = chave_info
         
-    @ui.button(label="Preencher Formulário", style=ui.ButtonStyle.primary)
+    @ui.button(label="Preencher Formulário", style=discord.ButtonStyle.primary)
     async def preencher_form(self, interaction: discord.Interaction, button: ui.Button):
         modal = FormularioLeilaoModal(self.chave_info)
         await interaction.response.send_modal(modal)
@@ -170,7 +170,7 @@ class ConfirmarLeilaoView(ui.View):
         self.preco = preco
         self.data_fim = data_fim
         
-    @ui.button(label="Enviar Leilão", style=ui.ButtonStyle.green)
+    @ui.button(label="Enviar Leilão", style=discord.ButtonStyle.green)
     async def enviar_leilao(self, interaction: discord.Interaction, button: ui.Button):
         c.execute("INSERT INTO leiloes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
                   (interaction.channel.id, interaction.user.id, self.chave, self.nome, 
