@@ -80,18 +80,18 @@ def gerar_chave():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
 
 def formatar_valor(valor):
-    return f"R$ {valor:,.2f}".replace('.', '|').replace(',', '.').replace('|', ',')
+    return f"R$ {valor:,.2f}".replace('.', 'temp').replace(',', '.').replace('temp', ',')
 
 def calcular_robux(quantidade, com_taxa):
     if com_taxa:
         valor = (quantidade / 1000) * 45.00
-        gamepass = int(quantidade / 0.7)  # Calcula para compensar os 30% do Roblox
+        gamepass = int(quantidade / 0.7)
     else:
         valor = (quantidade / 1000) * 35.00
         gamepass = quantidade
     return valor, gamepass
 
-# Classes para o sistema de leilão
+# Sistema de Leilão
 class LeilaoAtivoView(ui.View):
     def __init__(self, dono_id):
         super().__init__(timeout=None)
@@ -161,178 +161,6 @@ async def finalizar_leilao(message, canal_id):
 
     c.execute("DELETE FROM leiloes WHERE canal_id = ?", (canal_id,))
     conn.commit()
-
-class LeilaoView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        
-    @ui.button(label="Adicionar Chave", style=discord.ButtonStyle.green, custom_id="add_key")
-    async def add_key(self, interaction: discord.Interaction, button: ui.Button):
-        c.execute("SELECT ultimo_uso FROM cooldown_chaves WHERE user_id = ?", (interaction.user.id,))
-        cooldown = c.fetchone()
-        
-        if cooldown:
-            ultimo_uso = datetime.strptime(cooldown[0], "%Y-%m-%d %H:%M:%S")
-            if (datetime.now() - ultimo_uso) < timedelta(days=2):
-                await interaction.response.send_message(
-                    "⏳ Você só pode usar uma chave a cada 2 dias! Por favor, aguarde.",
-                    ephemeral=True
-                )
-                return
-        
-        modal = AdicionarChaveModal()
-        await interaction.response.send_modal(modal)
-
-class AdicionarChaveModal(ui.Modal, title="Adicionar Chave de Leilão"):
-    chave = ui.TextInput(label="Chave de Leilão", placeholder="Cole a chave que você recebeu aqui")
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        c.execute("SELECT * FROM chaves_leilao WHERE chave = ?", (str(self.chave),))
-        chave_info = c.fetchone()
-        
-        if not chave_info:
-            await interaction.response.send_message("❌ Chave inválida ou já utilizada!", ephemeral=True)
-            return
-            
-        if chave_info[3] <= 0:
-            await interaction.response.send_message("❌ Esta chave já foi usada o máximo de vezes!", ephemeral=True)
-            return
-            
-        canal_disponivel = None
-        for canal_id in CANAIS_LEILAO:
-            c.execute("SELECT 1 FROM leiloes WHERE canal_id = ?", (canal_id,))
-            if not c.fetchone():
-                canal_disponivel = canal_id
-                break
-                
-        if not canal_disponivel:
-            await interaction.response.send_message(
-                "⚠️ Todos os canais de leilão estão ocupados no momento. Por favor, aguarde até que um leilão termine.",
-                ephemeral=True
-            )
-            return
-            
-        c.execute("UPDATE chaves_leilao SET usos_restantes = usos_restantes - 1 WHERE chave = ?", (str(self.chave),))
-        c.execute("INSERT OR REPLACE INTO cooldown_chaves VALUES (?, ?)", 
-                 (interaction.user.id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
-        
-        embed = Embed(title="📝 Formulário de Leilão", color=0x3498db)
-        embed.description = "Por favor, preencha as informações sobre a conta que será leiloada."
-        
-        view = FormularioLeilaoView(chave_info, canal_disponivel)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-class FormularioLeilaoView(ui.View):
-    def __init__(self, chave_info, canal_id):
-        super().__init__()
-        self.chave_info = chave_info
-        self.canal_id = canal_id
-        
-    @ui.button(label="Preencher Formulário", style=discord.ButtonStyle.primary)
-    async def preencher_form(self, interaction: discord.Interaction, button: ui.Button):
-        modal = FormularioLeilaoModal(self.chave_info, self.canal_id)
-        await interaction.response.send_modal(modal)
-
-class FormularioLeilaoModal(ui.Modal, title="Formulário de Leilão"):
-    def __init__(self, chave_info, canal_id):
-        super().__init__()
-        self.chave_info = chave_info
-        self.canal_id = canal_id
-        
-    nome_conta = ui.TextInput(label="Nome da Conta")
-    jogos = ui.TextInput(label="Jogos da Conta", style=discord.TextStyle.long,
-                        placeholder="Separe por vírgulas (ex: Blox Fruits, Blue Lock)")
-    itens = ui.TextInput(label="Itens/Detalhes da Conta", style=discord.TextStyle.long)
-    preco = ui.TextInput(label="Preço Inicial (R$)")
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            preco_inicial = float(str(self.preco).replace(',', '.'))
-        except ValueError:
-            await interaction.response.send_message("❌ Por favor, insira um preço válido!", ephemeral=True)
-            return
-            
-        duracao = self.chave_info[1]
-        if 'd' in duracao:
-            dias = int(duracao.split('d')[0])
-            data_fim = datetime.now() + timedelta(days=dias)
-        elif 'h' in duracao:
-            horas = int(duracao.split('h')[0])
-            data_fim = datetime.now() + timedelta(hours=horas)
-        else:
-            data_fim = datetime.now() + timedelta(days=1)
-            
-        embed = Embed(title="✅ Leilão Pronto para Envio", color=0x2ecc71)
-        embed.add_field(name="Nome da Conta", value=str(self.nome_conta), inline=False)
-        embed.add_field(name="Jogos", value=str(self.jogos), inline=False)
-        embed.add_field(name="Itens/Detalhes", value=str(self.itens), inline=False)
-        embed.add_field(name="Preço Inicial", value=formatar_valor(preco_inicial), inline=False)
-        embed.add_field(name="Duração do Leilão", value=duracao, inline=False)
-        embed.set_footer(text="Revise as informações antes de enviar!")
-        
-        view = ConfirmarLeilaoView(
-            self.chave_info[0],
-            str(self.nome_conta),
-            str(self.jogos),
-            str(self.itens),
-            preco_inicial,
-            data_fim.strftime("%Y-%m-%d %H:%M:%S"),
-            self.canal_id
-        )
-        
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-class ConfirmarLeilaoView(ui.View):
-    def __init__(self, chave, nome, jogos, itens, preco, data_fim, canal_id):
-        super().__init__()
-        self.chave = chave
-        self.nome = nome
-        self.jogos = jogos
-        self.itens = itens
-        self.preco = preco
-        self.data_fim = data_fim
-        self.canal_id = canal_id
-        
-    @ui.button(label="Enviar Leilão", style=discord.ButtonStyle.green)
-    async def enviar_leilao(self, interaction: discord.Interaction, button: ui.Button):
-        c.execute("INSERT INTO leiloes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                  (self.canal_id, interaction.user.id, self.chave, self.nome, 
-                   self.jogos, self.itens, self.preco, self.preco, None, self.data_fim, None))
-        conn.commit()
-        
-        embed = Embed(title=f"🎟️ LEILÃO DE CONTA: {self.nome}", color=0xe67e22)
-        embed.description = (
-            "🏆 **Como participar?**\n"
-            "1. Envie uma mensagem respondendo a esta com o valor do seu lance (ex: 10.50)\n"
-            "2. Seu lance deve ser pelo menos R$ 0,50 maior que o atual\n"
-            "3. O vencedor será quem oferecer o maior valor quando o leilão encerrar\n\n"
-            "📢 **Regras Importantes:**\n"
-            "• Lances devem ser em números (ex: 10 ou 10.50)\n"
-            "• Diferença mínima entre lances: R$ 0,50\n"
-            "• Não é permitido cancelar lances após enviados\n"
-            "• O vencedor terá 24h para realizar o pagamento\n\n"
-            "⚠️ **Atenção:** Lances inválidos serão automaticamente removidos!"
-        )
-        embed.add_field(name="📌 Jogos Inclusos", value=self.jogos, inline=False)
-        embed.add_field(name="📦 Itens/Detalhes da Conta", value=self.itens, inline=False)
-        embed.add_field(name="💰 Preço Inicial", value=formatar_valor(self.preco), inline=True)
-        embed.add_field(name="⏳ Termina em", value=f"<t:{int(datetime.strptime(self.data_fim, '%Y-%m-%d %H:%M:%S').timestamp())}:R>", inline=True)
-        embed.add_field(name="🔢 Maior Lance Atual", value=formatar_valor(self.preco), inline=True)
-        embed.add_field(name="👤 Dono do Leilão", value=interaction.user.mention, inline=True)
-        embed.set_footer(text=f"ID do Leilão: {self.chave[:8]}...")
-        
-        canal_leiloes = bot.get_channel(self.canal_id)
-        
-        view = LeilaoAtivoView(interaction.user.id)
-        
-        msg = await canal_leiloes.send(content="@everyone 🎉 **NOVO LEILÃO INICIADO!**", embed=embed, view=view)
-        
-        c.execute("UPDATE leiloes SET message_id = ? WHERE canal_id = ?", (msg.id, self.canal_id))
-        conn.commit()
-        
-        asyncio.create_task(monitorar_lances(msg, self.canal_id))
-        await interaction.response.send_message(f"✅ Leilão criado com sucesso em {canal_leiloes.mention}!", ephemeral=True)
 
 async def monitorar_lances(message, canal_id):
     def check(m):
@@ -410,6 +238,7 @@ async def monitorar_lances(message, canal_id):
     
     await finalizar_leilao(message, canal_id)
 
+# Comandos Slash
 @bot.tree.command(name="calcular-robux", description="Calcula o valor em reais para uma quantidade de Robux")
 @app_commands.describe(quantidade="Quantidade de Robux")
 async def calcular_robux(interaction: discord.Interaction, quantidade: int):
@@ -567,6 +396,7 @@ async def pixinter(interaction: discord.Interaction):
     embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# Comando de prefixo (não slash)
 @bot.command(name="pix")
 async def pix(ctx):
     embed = Embed(title="💳 Informações para PIX", color=0x9b59b6)
@@ -575,6 +405,7 @@ async def pix(ctx):
     embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
     await ctx.send(embed=embed)
 
+# Comandos do sistema de leilão
 @bot.tree.command(name="gerarchave", description="Gera uma chave de leilão (apenas administradores)")
 @app_commands.describe(duracao="Duração (ex: 1d, 12h, 3d)", usos="Número de usos permitidos")
 @app_commands.checks.has_permissions(administrator=True)
