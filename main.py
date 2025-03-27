@@ -42,7 +42,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Conexão com o banco de dados
-conn = sqlite3.connect('dados_bot.db')
+conn = sqlite3.connect('dados_bot.db', check_same_thread=False)
 c = conn.cursor()
 
 # Criar tabelas
@@ -80,7 +80,7 @@ def gerar_chave():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
 
 def formatar_valor(valor):
-    return f"R$ {valor:.2f}".replace('.', ',')
+    return f"R$ {valor:,.2f}".replace('.', '|').replace(',', '.').replace('|', ',')
 
 def calcular_robux(quantidade, com_taxa):
     if com_taxa:
@@ -119,14 +119,19 @@ class LeilaoAtivoView(ui.View):
         await interaction.followup.send(f"⏱️ Leilão encerrado antecipadamente por {interaction.user.mention}")
         
         try:
-            message = await interaction.channel.fetch_message(leilao[9])  # message_id está na posição 9
+            message = await interaction.channel.fetch_message(leilao[9])
             await finalizar_leilao(message, interaction.channel.id)
         except:
             await interaction.followup.send("Não foi possível encontrar a mensagem do leilão.", ephemeral=True)
 
 async def finalizar_leilao(message, canal_id):
     c.execute("SELECT maior_lance_user, nome_conta, maior_lance FROM leiloes WHERE canal_id = ?", (canal_id,))
-    vencedor_id, nome_conta, valor_vencedor = c.fetchone()
+    resultado = c.fetchone()
+    
+    if not resultado:
+        return
+        
+    vencedor_id, nome_conta, valor_vencedor = resultado
     
     embed = message.embeds[0]
     embed.color = 0x2ecc71
@@ -163,7 +168,6 @@ class LeilaoView(ui.View):
         
     @ui.button(label="Adicionar Chave", style=discord.ButtonStyle.green, custom_id="add_key")
     async def add_key(self, interaction: discord.Interaction, button: ui.Button):
-        # Verificar cooldown
         c.execute("SELECT ultimo_uso FROM cooldown_chaves WHERE user_id = ?", (interaction.user.id,))
         cooldown = c.fetchone()
         
@@ -194,7 +198,6 @@ class AdicionarChaveModal(ui.Modal, title="Adicionar Chave de Leilão"):
             await interaction.response.send_message("❌ Esta chave já foi usada o máximo de vezes!", ephemeral=True)
             return
             
-        # Verificar se há canais de leilão disponíveis
         canal_disponivel = None
         for canal_id in CANAIS_LEILAO:
             c.execute("SELECT 1 FROM leiloes WHERE canal_id = ?", (canal_id,))
@@ -245,7 +248,7 @@ class FormularioLeilaoModal(ui.Modal, title="Formulário de Leilão"):
     
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            preco_inicial = float(str(self.preco))
+            preco_inicial = float(str(self.preco).replace(',', '.'))
         except ValueError:
             await interaction.response.send_message("❌ Por favor, insira um preço válido!", ephemeral=True)
             return
@@ -321,23 +324,22 @@ class ConfirmarLeilaoView(ui.View):
         
         canal_leiloes = bot.get_channel(self.canal_id)
         
-        # Criar view com botão de encerrar
         view = LeilaoAtivoView(interaction.user.id)
         
         msg = await canal_leiloes.send(content="@everyone 🎉 **NOVO LEILÃO INICIADO!**", embed=embed, view=view)
         
-        # Atualizar message_id no banco de dados
         c.execute("UPDATE leiloes SET message_id = ? WHERE canal_id = ?", (msg.id, self.canal_id))
         conn.commit()
         
         asyncio.create_task(monitorar_lances(msg, self.canal_id))
         await interaction.response.send_message(f"✅ Leilão criado com sucesso em {canal_leiloes.mention}!", ephemeral=True)
 
-# ... [código anterior permanece o mesmo até a função monitorar_lances] ...
-
 async def monitorar_lances(message, canal_id):
     def check(m):
-        return m.channel.id == canal_id and m.reference and m.reference.message_id == message.id
+        return (m.channel.id == canal_id and 
+                m.reference and 
+                m.reference.message_id == message.id and
+                not m.author.bot)
     
     while True:
         try:
@@ -350,38 +352,34 @@ async def monitorar_lances(message, canal_id):
             lance = await bot.wait_for('message', check=check, timeout=60)
             
             try:
-                valor = float(lance.content)
+                valor = float(lance.content.replace(',', '.'))
                 c.execute("SELECT maior_lance FROM leiloes WHERE canal_id = ?", (canal_id,))
                 maior_lance_atual = c.fetchone()[0]
                 
-                # Verifica se o lance é menor que o atual
                 if valor <= maior_lance_atual:
                     await lance.delete()
-                    await lance.author.send(
-                        "⚠️ Um usuário já deu um lance maior que este!\n"
-                        f"Lance atual: {formatar_valor(maior_lance_atual)}\n"
-                        f"Seu lance: {formatar_valor(valor)}",
-                        delete_after=15
+                    msg = await message.channel.send(
+                        f"{lance.author.mention} ❌ Lance recusado! Valor menor que o atual ({formatar_valor(maior_lance_atual)})",
+                        delete_after=10
                     )
+                    await asyncio.sleep(10)
+                    await msg.delete()
                     continue
                     
-                # Verifica diferença mínima de R$ 0,50
-                if valor < maior_lance_atual + 0.5:
+                if (valor - maior_lance_atual) < 0.5:
                     await lance.delete()
-                    await lance.author.send(
-                        "⚠️ Diferença mínima de R$ 0,50 necessária!\n"
-                        f"Lance atual: {formatar_valor(maior_lance_atual)}\n"
-                        f"Próximo lance mínimo: {formatar_valor(maior_lance_atual + 0.5)}",
-                        delete_after=15
+                    msg = await message.channel.send(
+                        f"{lance.author.mention} ❌ Diferença mínima de R$0,50 não atingida! Próximo lance: {formatar_valor(maior_lance_atual + 0.5)}",
+                        delete_after=10
                     )
+                    await asyncio.sleep(10)
+                    await msg.delete()
                     continue
                     
-                # Atualiza o lance no banco de dados
                 c.execute("UPDATE leiloes SET maior_lance = ?, maior_lance_user = ? WHERE canal_id = ?",
-                          (valor, lance.author.id, canal_id))
+                         (valor, lance.author.id, canal_id))
                 conn.commit()
                 
-                # Atualiza a embed do leilão
                 embed = message.embeds[0]
                 for i, field in enumerate(embed.fields):
                     if field.name == "🔢 Maior Lance Atual":
@@ -391,30 +389,32 @@ async def monitorar_lances(message, canal_id):
                 await message.edit(embed=embed)
                 await lance.add_reaction("✅")
                 
-            except ValueError:
-                # Apaga mensagens que não são números
-                await lance.delete()
-                await lance.author.send(
-                    "❌ Formato inválido!\n"
-                    "Envie apenas o valor do seu lance em número.\n"
-                    "Exemplo: `10` ou `10.50`",
-                    delete_after=15
+                msg = await message.channel.send(
+                    f"✅ {lance.author.mention} deu um lance de {formatar_valor(valor)}!",
+                    delete_after=10
                 )
+                await asyncio.sleep(10)
+                await msg.delete()
+                
+            except ValueError:
+                await lance.delete()
+                msg = await message.channel.send(
+                    f"{lance.author.mention} ❌ Formato inválido! Use apenas números (ex: 10 ou 10.50)",
+                    delete_after=10
+                )
+                await asyncio.sleep(10)
+                await msg.delete()
                 
         except asyncio.TimeoutError:
             continue
     
     await finalizar_leilao(message, canal_id)
 
-# ... [o restante do código anterior permanece igual] ...
-
 @bot.tree.command(name="calcular-robux", description="Calcula o valor em reais para uma quantidade de Robux")
 @app_commands.describe(quantidade="Quantidade de Robux")
 async def calcular_robux(interaction: discord.Interaction, quantidade: int):
-    # Responder imediatamente para evitar "application did not respond"
     await interaction.response.defer()
     
-    # Cálculos
     valor_com_taxa, gamepass_com_taxa = calcular_robux(quantidade, True)
     valor_sem_taxa, gamepass_sem_taxa = calcular_robux(quantidade, False)
     
@@ -440,7 +440,6 @@ async def calcular_robux(interaction: discord.Interaction, quantidade: int):
     
     await interaction.followup.send(embed=embed)
 
-# ... [o restante do código permanece igual] ...
 @bot.tree.command(name="reservar", description="Faz uma reserva")
 @app_commands.describe(nick="Nick do cliente", produto="Produto reservado")
 async def reservar(interaction: discord.Interaction, nick: str, produto: str):
@@ -568,7 +567,6 @@ async def pixinter(interaction: discord.Interaction):
     embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Comando de prefixo (não slash)
 @bot.command(name="pix")
 async def pix(ctx):
     embed = Embed(title="💳 Informações para PIX", color=0x9b59b6)
@@ -577,7 +575,6 @@ async def pix(ctx):
     embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
     await ctx.send(embed=embed)
 
-# Comandos do sistema de leilão
 @bot.tree.command(name="gerarchave", description="Gera uma chave de leilão (apenas administradores)")
 @app_commands.describe(duracao="Duração (ex: 1d, 12h, 3d)", usos="Número de usos permitidos")
 @app_commands.checks.has_permissions(administrator=True)
@@ -614,7 +611,6 @@ async def leilao(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f'Bot {bot.user.name} está online!')
-    # Adicionar as views persistentes
     bot.add_view(LeilaoView())
     bot.add_view(LeilaoAtivoView(dono_id=0))
     try:
