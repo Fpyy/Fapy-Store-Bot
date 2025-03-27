@@ -333,6 +333,8 @@ class ConfirmarLeilaoView(ui.View):
         asyncio.create_task(monitorar_lances(msg, self.canal_id))
         await interaction.response.send_message(f"✅ Leilão criado com sucesso em {canal_leiloes.mention}!", ephemeral=True)
 
+# ... [código anterior permanece o mesmo até a função monitorar_lances] ...
+
 async def monitorar_lances(message, canal_id):
     def check(m):
         return m.channel.id == canal_id and m.reference and m.reference.message_id == message.id
@@ -352,28 +354,34 @@ async def monitorar_lances(message, canal_id):
                 c.execute("SELECT maior_lance FROM leiloes WHERE canal_id = ?", (canal_id,))
                 maior_lance_atual = c.fetchone()[0]
                 
+                # Verifica se o lance é menor que o atual
                 if valor <= maior_lance_atual:
                     await lance.delete()
                     await lance.author.send(
-                        f"⚠️ Seu lance de {formatar_valor(valor)} é menor ou igual ao atual de {formatar_valor(maior_lance_atual)}. "
-                        "Envie um valor maior!",
-                        delete_after=10
+                        "⚠️ Um usuário já deu um lance maior que este!\n"
+                        f"Lance atual: {formatar_valor(maior_lance_atual)}\n"
+                        f"Seu lance: {formatar_valor(valor)}",
+                        delete_after=15
                     )
                     continue
                     
+                # Verifica diferença mínima de R$ 0,50
                 if valor < maior_lance_atual + 0.5:
                     await lance.delete()
                     await lance.author.send(
-                        f"⚠️ Diferença mínima de R$ 0,50 necessária. "
-                        f"O próximo lance deve ser pelo menos {formatar_valor(maior_lance_atual + 0.5)}",
-                        delete_after=10
+                        "⚠️ Diferença mínima de R$ 0,50 necessária!\n"
+                        f"Lance atual: {formatar_valor(maior_lance_atual)}\n"
+                        f"Próximo lance mínimo: {formatar_valor(maior_lance_atual + 0.5)}",
+                        delete_after=15
                     )
                     continue
                     
+                # Atualiza o lance no banco de dados
                 c.execute("UPDATE leiloes SET maior_lance = ?, maior_lance_user = ? WHERE canal_id = ?",
                           (valor, lance.author.id, canal_id))
                 conn.commit()
                 
+                # Atualiza a embed do leilão
                 embed = message.embeds[0]
                 for i, field in enumerate(embed.fields):
                     if field.name == "🔢 Maior Lance Atual":
@@ -384,10 +392,13 @@ async def monitorar_lances(message, canal_id):
                 await lance.add_reaction("✅")
                 
             except ValueError:
+                # Apaga mensagens que não são números
                 await lance.delete()
                 await lance.author.send(
-                    "⚠️ Formato inválido! Envie apenas o valor do lance (ex: 10 ou 10.50)",
-                    delete_after=10
+                    "❌ Formato inválido!\n"
+                    "Envie apenas o valor do seu lance em número.\n"
+                    "Exemplo: `10` ou `10.50`",
+                    delete_after=15
                 )
                 
         except asyncio.TimeoutError:
@@ -395,10 +406,15 @@ async def monitorar_lances(message, canal_id):
     
     await finalizar_leilao(message, canal_id)
 
-# Comandos Slash
+# ... [o restante do código anterior permanece igual] ...
+
 @bot.tree.command(name="calcular-robux", description="Calcula o valor em reais para uma quantidade de Robux")
 @app_commands.describe(quantidade="Quantidade de Robux")
 async def calcular_robux(interaction: discord.Interaction, quantidade: int):
+    # Responder imediatamente para evitar "application did not respond"
+    await interaction.response.defer()
+    
+    # Cálculos
     valor_com_taxa, gamepass_com_taxa = calcular_robux(quantidade, True)
     valor_sem_taxa, gamepass_sem_taxa = calcular_robux(quantidade, False)
     
@@ -422,8 +438,9 @@ async def calcular_robux(interaction: discord.Interaction, quantidade: int):
     )
     embed.set_footer(text="Os valores podem variar conforme a cotação atual")
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
+# ... [o restante do código permanece igual] ...
 @bot.tree.command(name="reservar", description="Faz uma reserva")
 @app_commands.describe(nick="Nick do cliente", produto="Produto reservado")
 async def reservar(interaction: discord.Interaction, nick: str, produto: str):
