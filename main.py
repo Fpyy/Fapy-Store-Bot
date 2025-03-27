@@ -188,7 +188,7 @@ class ConfirmarLeilaoView(ui.View):
         embed.add_field(name="📌 Jogos", value=self.jogos, inline=False)
         embed.add_field(name="📦 Itens/Detalhes", value=self.itens, inline=False)
         embed.add_field(name="💰 Preço Inicial", value=formatar_valor(self.preco), inline=True)
-        embed.add_field(name="⏳ Termina em", value=f"<t:{int(datetime.strptime(self.data_fim, '%Y-%m-%d %H:%M:%S').timestamp()}:R>", inline=True)
+        embed.add_field(name="⏳ Termina em", value=f"<t:{int(datetime.strptime(self.data_fim, '%Y-%m-%d %H:%M:%S').timestamp())}:R>", inline=True)
         embed.add_field(name="🔢 Maior Lance Atual", value=formatar_valor(self.preco), inline=True)
         embed.add_field(name="👤 Dono do Leilão", value=interaction.user.mention, inline=True)
         embed.set_footer(text=f"ID do Leilão: {self.chave[:8]}...")
