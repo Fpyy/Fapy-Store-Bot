@@ -84,7 +84,8 @@ def gerar_chave():
 def formatar_valor(valor):
     return f"R$ {valor:,.2f}".replace('.', 'temp').replace(',', '.').replace('temp', ',')
 
-def calcular_robux(quantidade, com_taxa):
+# Renomeei a função para evitar conflito com o comando
+def calcular_valor_robux(quantidade, com_taxa):
     if com_taxa:
         valor = (quantidade / 1000) * 45.00
         gamepass = int(quantidade / 0.7)
@@ -494,21 +495,33 @@ auction_system = AuctionSystem(bot)
 @bot.tree.command(name="calcular_robux", description="Calcula o valor em reais para Robux")
 @app_commands.describe(quantidade="Quantidade de Robux")
 async def calcular_robux(interaction: Interaction, quantidade: int):
-    valor_com, gamepass_com = calcular_robux(quantidade, True)
-    valor_sem, gamepass_sem = calcular_robux(quantidade, False)
+    await interaction.response.defer()  # Adiciona defer para evitar timeout
+    
+    # Usa a função renomeada
+    valor_com, gamepass_com = calcular_valor_robux(quantidade, True)
+    valor_sem, gamepass_sem = calcular_valor_robux(quantidade, False)
     
     embed = Embed(title="💰 Cálculo de Robux", color=0x3498db)
     embed.add_field(
-        name=f"🔹 {quantidade} Robux com taxa",
-        value=f"**Valor:** {formatar_valor(valor_com)}\n**Gamepass:** {gamepass_com} Robux",
+        name=f"🔹 {quantidade} Robux com taxa (R$ 0,045 por Robux)",
+        value=(
+            f"**Valor:** {formatar_valor(valor_com)}\n"
+            f"**Preço da Gamepass:** {gamepass_com} Robux\n"
+            f"(Para receber {quantidade} Robux após a taxa de 30%)"
+        ),
         inline=False
     )
     embed.add_field(
-        name=f"🔸 {quantidade} Robux sem taxa",
-        value=f"**Valor:** {formatar_valor(valor_sem)}\n**Gamepass:** {gamepass_sem} Robux",
+        name=f"🔸 {quantidade} Robux sem taxa (R$ 0,035 por Robux)",
+        value=(
+            f"**Valor:** {formatar_valor(valor_sem)}\n"
+            f"**Preço da Gamepass:** {gamepass_sem} Robux"
+        ),
         inline=False
     )
-    await interaction.response.send_message(embed=embed)
+    embed.set_footer(text="Os valores podem variar conforme a cotação atual")
+    
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="reservar", description="Faz uma reserva")
 @app_commands.describe(nick="Nick do cliente", produto="Produto reservado")
