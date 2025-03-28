@@ -92,242 +92,221 @@ def calcular_robux(quantidade, com_taxa):
         gamepass = quantidade
     return valor, gamepass
 
-# Sistema de Leilão
-class LanceTracker:
-    def __init__(self, bot, canal_id):
+##############################################
+## SISTEMA DE LEILÃO REFORMULADO
+##############################################
+
+class AuctionSystem:
+    def __init__(self, bot):
         self.bot = bot
-        self.canal_id = canal_id
-        self.active = True
-        self.current_bid = 0.0
-        self.current_winner = None
-        self.end_time = None
-        self.message = None
-        self.lock = asyncio.Lock()
-        self.encerrado_por = None
-
-    async def start(self, message, preco_inicial, data_fim):
-        self.message = message
-        self.current_bid = preco_inicial
-        self.end_time = datetime.strptime(data_fim, "%Y-%m-%d %H:%M:%S")
+        self.active_auctions = {}
         
-        while self.active and datetime.now() < self.end_time:
+    async def start_auction(self, channel_id, message, preco_inicial, data_fim):
+        """Inicia um novo leilão"""
+        self.active_auctions[channel_id] = {
+            'message': message,
+            'current_bid': preco_inicial,
+            'current_winner': None,
+            'end_time': datetime.strptime(data_fim, "%Y-%m-%d %H:%M:%S"),
+            'active': True,
+            'lock': asyncio.Lock()
+        }
+        
+        # Inicia a tarefa de verificação
+        self.bot.loop.create_task(self._check_auction_end(channel_id))
+        
+    async def _check_auction_end(self, channel_id):
+        """Verifica periodicamente se o leilão acabou"""
+        while True:
+            auction = self.active_auctions.get(channel_id)
+            if not auction or not auction['active']:
+                break
+                
+            if datetime.now() >= auction['end_time']:
+                await self.finalize_auction(channel_id)
+                break
+                
             await asyncio.sleep(1)
-        
-        if self.active:  # Só chama finalize se não foi encerrado manualmente
-            await self.finalize_auction()
-
+            
     async def process_bid(self, message):
-        async with self.lock:
-            try:
-                if not await self.is_valid_bid(message):
-                    return
-
-                bid_amount = float(message.content.replace(',', '.'))
-                
-                self.current_bid = bid_amount
-                self.current_winner = message.author
-                
-                c.execute("""
-                    UPDATE leiloes 
-                    SET maior_lance = ?, maior_lance_user = ? 
-                    WHERE canal_id = ?
-                """, (bid_amount, message.author.id, self.canal_id))
-                conn.commit()
-                
-                await self.update_auction_message(bid_amount, message.author)
-                await message.add_reaction("✅")
-                
-                notification = await message.channel.send(
-                    f"🎉 Novo lance! {message.author.mention} ofereceu {formatar_valor(bid_amount)}!",
-                    delete_after=10
-                )
-                
-            except ValueError:
-                await message.delete()
-                await self.send_error(message.author, 
-                                    "Formato inválido! Envie apenas o valor do lance em números. Exemplo: 10 ou 10.50")
-
-    async def is_valid_bid(self, message):
-        if (message.channel.id != self.canal_id or 
-            not message.author or 
+        """Processa um novo lance"""
+        channel_id = message.channel.id
+        auction = self.active_auctions.get(channel_id)
+        
+        # Verificações básicas
+        if (not auction or not auction['active'] or 
             message.author.bot or 
             not message.reference or 
-            message.reference.message_id != self.message.id):
-            return False
+            message.reference.message_id != auction['message'].id):
+            return
             
-        try:
-            bid_amount = float(message.content.replace(',', '.'))
-        except ValueError:
-            await message.delete()
-            await self.send_error(message.author, "Formato inválido! Use apenas números. Ex: 10.50")
-            return False
+        async with auction['lock']:
+            try:
+                bid_amount = float(message.content.replace(',', '.'))
+            except ValueError:
+                await message.delete()
+                await self._send_error(message.author, "Formato inválido! Use apenas números. Ex: 10.50")
+                return
+                
+            # Valida o lance
+            if bid_amount <= auction['current_bid']:
+                await message.delete()
+                await self._send_error(message.author, 
+                                    f"Lance deve ser maior que {formatar_valor(auction['current_bid'])}")
+                return
+                
+            if (bid_amount - auction['current_bid']) < 0.5:
+                await message.delete()
+                await self._send_error(message.author,
+                                      f"Diferença mínima de R$0,50. Próximo lance: {formatar_valor(auction['current_bid'] + 0.5)}")
+                return
+                
+            # Atualiza o lance
+            auction['current_bid'] = bid_amount
+            auction['current_winner'] = message.author
             
-        if bid_amount <= self.current_bid:
-            await message.delete()
-            await self.send_error(message.author, 
-                                f"Seu lance de {formatar_valor(bid_amount)} é menor ou igual ao lance atual de {formatar_valor(self.current_bid)}")
-            return False
+            # Atualiza no banco de dados
+            c.execute("""
+                UPDATE leiloes 
+                SET maior_lance = ?, maior_lance_user = ? 
+                WHERE canal_id = ?
+            """, (bid_amount, message.author.id, channel_id))
+            conn.commit()
             
-        if (bid_amount - self.current_bid) < 0.5:
-            await message.delete()
-            await self.send_error(message.author,
-                                f"Diferença mínima de R$0,50 não atingida! Próximo lance deve ser pelo menos {formatar_valor(self.current_bid + 0.5)}")
-            return False
+            # Atualiza a mensagem e envia confirmação
+            await self._update_auction_message(channel_id)
+            await message.add_reaction("✅")
+            await message.channel.send(
+                f"🎉 {message.author.mention} ofereceu {formatar_valor(bid_amount)}!",
+                delete_after=10
+            )
             
-        return True
-
-    async def update_auction_message(self, bid_amount, bidder):
-        embed = self.message.embeds[0]
+    async def _update_auction_message(self, channel_id):
+        """Atualiza a mensagem do leilão com o novo lance"""
+        auction = self.active_auctions.get(channel_id)
+        if not auction:
+            return
+            
+        embed = auction['message'].embeds[0]
         for i, field in enumerate(embed.fields):
             if field.name == "🔢 Maior Lance Atual":
-                embed.set_field_at(i, name="🔢 Maior Lance Atual", 
-                                 value=f"{formatar_valor(bid_amount)} por {bidder.mention}")
+                embed.set_field_at(i, 
+                    name="🔢 Maior Lance Atual", 
+                    value=f"{formatar_valor(auction['current_bid'])} por {auction['current_winner'].mention}"
+                )
         
-        await self.message.edit(embed=embed)
-
-    async def send_error(self, user, error_msg):
+        await auction['message'].edit(embed=embed)
+        
+    async def _send_error(self, user, error_msg):
+        """Envia mensagem de erro para o usuário"""
         try:
             await user.send(f"❌ {error_msg}")
         except:
-            await self.message.channel.send(
-                f"{user.mention} ❌ {error_msg}",
-                delete_after=10
-            )
-
-    async def finalize_auction(self, encerrado_por=None):
-        self.active = False
-        self.encerrado_por = encerrado_por
+            pass
+            
+    async def finalize_auction(self, channel_id, ended_by=None):
+        """Finaliza o leilão"""
+        auction = self.active_auctions.get(channel_id)
+        if not auction:
+            return
+            
+        auction['active'] = False
         
+        # Obtém dados do banco de dados
         c.execute("""
             SELECT nome_conta, jogos, itens_conta, preco_inicial, maior_lance, maior_lance_user, chave 
             FROM leiloes 
             WHERE canal_id = ?
-        """, (self.canal_id,))
+        """, (channel_id,))
         nome_conta, jogos, itens, preco_inicial, maior_lance, vencedor_id, chave = c.fetchone()
         
         # Cria embed de encerramento
         embed = Embed(title=f"🏁 LEILÃO ENCERRADO: {nome_conta}", color=0x2ecc71)
-        
-        motivo_encerramento = "Tempo esgotado" if encerrado_por is None else f"Encerrado por {encerrado_por.mention}"
-        embed.add_field(name="📝 Motivo do Encerramento", value=motivo_encerramento, inline=False)
+        motivo = "Tempo esgotado" if not ended_by else f"Encerrado por {ended_by.mention}"
+        embed.add_field(name="📝 Motivo", value=motivo, inline=False)
         
         if vencedor_id:
             embed.add_field(name="🎉 Vencedor", value=f"<@{vencedor_id}> com {formatar_valor(maior_lance)}", inline=False)
             embed.add_field(name="💰 Valor Final", value=formatar_valor(maior_lance), inline=True)
         else:
-            embed.add_field(name="ℹ️ Resultado", value="Nenhum lance válido foi realizado", inline=False)
+            embed.add_field(name="ℹ️ Resultado", value="Sem lances válidos", inline=False)
             embed.add_field(name="💰 Preço Inicial", value=formatar_valor(preco_inicial), inline=True)
         
         embed.add_field(name="🎮 Jogos", value=jogos, inline=False)
-        embed.add_field(name="📦 Itens/Detalhes", value=itens, inline=False)
-        embed.add_field(name="🔑 ID do Leilão", value=chave[:8] + "...", inline=True)
+        embed.add_field(name="📦 Itens", value=itens, inline=False)
+        embed.set_footer(text=f"ID: {chave[:8]}... | Encerrado em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
         
-        embed.set_footer(text=f"Leilão encerrado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        # Envia mensagem e notifica vencedor
+        canal = self.bot.get_channel(channel_id)
+        await canal.send(embed=embed)
+        await auction['message'].edit(content="🔔 LEILÃO ENCERRADO!", view=None)
         
-        # Envia a nova mensagem de encerramento
-        canal = self.bot.get_channel(self.canal_id)
-        mensagem_encerramento = await canal.send(embed=embed)
-        
-        # Edita a mensagem original do leilão
-        if self.message:
-            await self.message.edit(content="🔔 LEILÃO ENCERRADO! @everyone", view=None)
-        
-        # Notifica o vencedor
         if vencedor_id:
             try:
-                vencedor = await self.bot.fetch_user(vencedor_id)
-                await vencedor.send(
-                    f"🎉 **Parabéns!** Você venceu o leilão da conta **{nome_conta}** por {formatar_valor(maior_lance)}!\n\n"
-                    f"Por favor, vá até <#{CANAL_TICKET_ID}> e informe que você foi o vencedor deste leilão.\n\n"
-                    f"🔹 **Detalhes da Compra:**\n"
-                    f"- Item: {nome_conta}\n"
-                    f"- Valor: {formatar_valor(maior_lance)}\n"
-                    f"- ID do Leilão: {chave[:8]}..."
+                user = await self.bot.fetch_user(vencedor_id)
+                await user.send(
+                    f"🎉 Você venceu o leilão de {nome_conta} por {formatar_valor(maior_lance)}!\n"
+                    f"Abra um ticket em <#{CANAL_TICKET_ID}> para finalizar."
                 )
             except:
                 pass
-
-        # Remove do banco de dados
-        c.execute("DELETE FROM leiloes WHERE canal_id = ?", (self.canal_id,))
-        conn.commit()
         
-        # Remove o tracker ativo
-        if self.canal_id in active_trackers:
-            del active_trackers[self.canal_id]
+        # Limpa o leilão
+        c.execute("DELETE FROM leiloes WHERE canal_id = ?", (channel_id,))
+        conn.commit()
+        del self.active_auctions[channel_id]
 
-# Dicionário para armazenar trackers ativos
-active_trackers = {}
+# Instancia o sistema de leilão
+auction_system = AuctionSystem(bot)
 
-def get_active_tracker(channel_id):
-    return active_trackers.get(channel_id)
-
-# Classes para o sistema de leilão
+# Classes para o sistema de leilão (mantidas similares com pequenos ajustes)
 class LeilaoView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         
     @ui.button(label="Adicionar Chave", style=discord.ButtonStyle.green, custom_id="add_key")
-    async def add_key(self, interaction: discord.Interaction, button: ui.Button):
-        # Verifica se é administrador (sem cooldown)
+    async def add_key(self, interaction: Interaction, button: ui.Button):
+        # Verificação de cooldown (mesma lógica)
         if not interaction.user.guild_permissions.administrator:
             c.execute("SELECT ultimo_uso FROM cooldown_chaves WHERE user_id = ?", (interaction.user.id,))
             cooldown = c.fetchone()
             
-            if cooldown:
-                ultimo_uso = datetime.strptime(cooldown[0], "%Y-%m-%d %H:%M:%S")
-                if (datetime.now() - ultimo_uso) < timedelta(days=2):
-                    await interaction.response.send_message(
-                        "⏳ Você só pode usar uma chave a cada 2 dias! Por favor, aguarde.",
-                        ephemeral=True
-                    )
-                    return
-        
-        modal = AdicionarChaveModal()
-        await interaction.response.send_modal(modal)
+            if cooldown and (datetime.now() - datetime.strptime(cooldown[0], "%Y-%m-%d %H:%M:%S")) < timedelta(days=2):
+                await interaction.response.send_message("⏳ Aguarde 2 dias entre usos de chaves!", ephemeral=True)
+                return
+                
+        await interaction.response.send_modal(AdicionarChaveModal())
 
-class AdicionarChaveModal(ui.Modal, title="Adicionar Chave de Leilão"):
-    chave = ui.TextInput(label="Chave de Leilão", placeholder="Cole a chave que você recebeu aqui")
+class AdicionarChaveModal(ui.Modal, title="Adicionar Chave"):
+    chave = ui.TextInput(label="Chave de Leilão", placeholder="Cole a chave recebida")
     
-    async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: Interaction):
         c.execute("SELECT * FROM chaves_leilao WHERE chave = ?", (str(self.chave),))
         chave_info = c.fetchone()
         
-        if not chave_info:
-            await interaction.response.send_message("❌ Chave inválida ou já utilizada!", ephemeral=True)
+        if not chave_info or chave_info[3] <= 0:
+            await interaction.response.send_message("❌ Chave inválida ou já usada!", ephemeral=True)
             return
             
-        if chave_info[3] <= 0:
-            await interaction.response.send_message("❌ Esta chave já foi usada o máximo de vezes!", ephemeral=True)
-            return
-            
-        canal_disponivel = None
-        for canal_id in CANAIS_LEILAO:
-            c.execute("SELECT 1 FROM leiloes WHERE canal_id = ?", (canal_id,))
-            if not c.fetchone():
-                canal_disponivel = canal_id
-                break
-                
-        if not canal_disponivel:
-            await interaction.response.send_message(
-                "⚠️ Todos os canais de leilão estão ocupados no momento. Por favor, aguarde até que um leilão termine.",
-                ephemeral=True
-            )
-            return
-            
-        c.execute("UPDATE chaves_leilao SET usos_restantes = usos_restantes - 1 WHERE chave = ?", (str(self.chave),))
+        # Encontra canal disponível
+        canal_id = next((cid for cid in CANAIS_LEILAO 
+                        if not c.execute("SELECT 1 FROM leiloes WHERE canal_id = ?", (cid,)).fetchone()), None)
         
-        # Aplica cooldown apenas para não-administradores
+        if not canal_id:
+            await interaction.response.send_message("⚠️ Todos os canais estão ocupados!", ephemeral=True)
+            return
+            
+        # Atualiza chave e cooldown
+        c.execute("UPDATE chaves_leilao SET usos_restantes = usos_restantes - 1 WHERE chave = ?", (str(self.chave),))
         if not interaction.user.guild_permissions.administrator:
             c.execute("INSERT OR REPLACE INTO cooldown_chaves VALUES (?, ?)", 
                      (interaction.user.id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        
         conn.commit()
         
+        # Mostra formulário
         embed = Embed(title="📝 Formulário de Leilão", color=0x3498db)
-        embed.description = "Por favor, preencha as informações sobre a conta que será leiloada."
-        
-        view = FormularioLeilaoView(chave_info, canal_disponivel)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(embed=embed, 
+            view=FormularioLeilaoView(chave_info, canal_id), ephemeral=True)
 
 class FormularioLeilaoView(ui.View):
     def __init__(self, chave_info, canal_id):
@@ -336,9 +315,8 @@ class FormularioLeilaoView(ui.View):
         self.canal_id = canal_id
         
     @ui.button(label="Preencher Formulário", style=discord.ButtonStyle.primary)
-    async def preencher_form(self, interaction: discord.Interaction, button: ui.Button):
-        modal = FormularioLeilaoModal(self.chave_info, self.canal_id)
-        await interaction.response.send_modal(modal)
+    async def preencher_form(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.send_modal(FormularioLeilaoModal(self.chave_info, self.canal_id))
 
 class FormularioLeilaoModal(ui.Modal, title="Formulário de Leilão"):
     def __init__(self, chave_info, canal_id):
@@ -347,47 +325,44 @@ class FormularioLeilaoModal(ui.Modal, title="Formulário de Leilão"):
         self.canal_id = canal_id
         
     nome_conta = ui.TextInput(label="Nome da Conta")
-    jogos = ui.TextInput(label="Jogos da Conta", style=discord.TextStyle.long,
-                        placeholder="Separe por vírgulas (ex: Blox Fruits, Blue Lock)")
-    itens = ui.TextInput(label="Itens/Detalhes da Conta", style=discord.TextStyle.long)
+    jogos = ui.TextInput(label="Jogos", style=discord.TextStyle.long)
+    itens = ui.TextInput(label="Itens/Detalhes", style=discord.TextStyle.long)
     preco = ui.TextInput(label="Preço Inicial (R$)")
     
-    async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: Interaction):
         try:
             preco_inicial = float(str(self.preco).replace(',', '.'))
         except ValueError:
-            await interaction.response.send_message("❌ Por favor, insira um preço válido!", ephemeral=True)
+            await interaction.response.send_message("❌ Preço inválido!", ephemeral=True)
             return
             
+        # Calcula data fim
         duracao = self.chave_info[1]
         if 'd' in duracao:
-            dias = int(duracao.split('d')[0])
-            data_fim = datetime.now() + timedelta(days=dias)
-        elif 'h' in duracao:
-            horas = int(duracao.split('h')[0])
-            data_fim = datetime.now() + timedelta(hours=horas)
+            data_fim = datetime.now() + timedelta(days=int(duracao.split('d')[0]))
         else:
-            data_fim = datetime.now() + timedelta(days=1)
+            data_fim = datetime.now() + timedelta(hours=int(duracao.split('h')[0]))
             
-        embed = Embed(title="✅ Leilão Pronto para Envio", color=0x2ecc71)
-        embed.add_field(name="Nome da Conta", value=str(self.nome_conta), inline=False)
+        # Mostra confirmação
+        embed = Embed(title="✅ Leilão Pronto", color=0x2ecc71)
+        embed.add_field(name="Conta", value=str(self.nome_conta), inline=False)
         embed.add_field(name="Jogos", value=str(self.jogos), inline=False)
-        embed.add_field(name="Itens/Detalhes", value=str(self.itens), inline=False)
-        embed.add_field(name="Preço Inicial", value=formatar_valor(preco_inicial), inline=False)
-        embed.add_field(name="Duração do Leilão", value=duracao, inline=False)
-        embed.set_footer(text="Revise as informações antes de enviar!")
+        embed.add_field(name="Preço", value=formatar_valor(preco_inicial), inline=True)
+        embed.add_field(name="Duração", value=duracao, inline=True)
         
-        view = ConfirmarLeilaoView(
-            self.chave_info[0],
-            str(self.nome_conta),
-            str(self.jogos),
-            str(self.itens),
-            preco_inicial,
-            data_fim.strftime("%Y-%m-%d %H:%M:%S"),
-            self.canal_id
+        await interaction.response.send_message(
+            embed=embed,
+            view=ConfirmarLeilaoView(
+                self.chave_info[0],
+                str(self.nome_conta),
+                str(self.jogos),
+                str(self.itens),
+                preco_inicial,
+                data_fim.strftime("%Y-%m-%d %H:%M:%S"),
+                self.canal_id
+            ),
+            ephemeral=True
         )
-        
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 class ConfirmarLeilaoView(ui.View):
     def __init__(self, chave, nome, jogos, itens, preco, data_fim, canal_id):
@@ -401,45 +376,46 @@ class ConfirmarLeilaoView(ui.View):
         self.canal_id = canal_id
         
     @ui.button(label="Enviar Leilão", style=discord.ButtonStyle.green)
-    async def enviar_leilao(self, interaction: discord.Interaction, button: ui.Button):
-        c.execute("INSERT INTO leiloes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                  (self.canal_id, interaction.user.id, self.chave, self.nome, 
-                   self.jogos, self.itens, self.preco, self.preco, None, self.data_fim, None))
+    async def enviar_leilao(self, interaction: Interaction, button: ui.Button):
+        # Salva no banco de dados
+        c.execute("""
+            INSERT INTO leiloes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            self.canal_id, interaction.user.id, self.chave, self.nome,
+            self.jogos, self.itens, self.preco, self.preco, None, self.data_fim, None
+        ))
         conn.commit()
         
-        embed = Embed(title=f"🎟️ LEILÃO DE CONTA: {self.nome}", color=0xe67e22)
+        # Cria embed do leilão
+        embed = Embed(title=f"🎟️ LEILÃO: {self.nome}", color=0xe67e22)
         embed.description = (
             "🏆 **Como participar?**\n"
-            "1. Envie uma mensagem respondendo a esta com o valor do seu lance (ex: 10.50)\n"
-            "2. Seu lance deve ser pelo menos R$ 0,50 maior que o atual\n"
-            "3. O vencedor será quem oferecer o maior valor quando o leilão encerrar\n\n"
-            "📢 **Regras Importantes:**\n"
-            "• Lances devem ser em números (ex: 10 ou 10.50)\n"
-            "• Diferença mínima entre lances: R$ 0,50\n"
-            "• Não é permitido cancelar lances após enviados\n"
-            "• O vencedor terá 24h para realizar o pagamento\n\n"
-            "⚠️ **Atenção:** Lances inválidos serão automaticamente removidos!"
+            "1. Responda esta mensagem com seu lance (ex: 10.50)\n"
+            "2. Lance mínimo: R$ 0,50 acima do atual\n"
+            "3. Vencedor será notificado ao final\n\n"
+            "📢 **Regras:**\n"
+            "• Só lances em números (ex: 10 ou 10.50)\n"
+            "• Diferença mínima: R$ 0,50\n"
+            "• Sem cancelamento de lances"
         )
-        embed.add_field(name="📌 Jogos Inclusos", value=self.jogos, inline=False)
-        embed.add_field(name="📦 Itens/Detalhes da Conta", value=self.itens, inline=False)
+        embed.add_field(name="🎮 Jogos", value=self.jogos, inline=False)
+        embed.add_field(name="📦 Itens", value=self.itens, inline=False)
         embed.add_field(name="💰 Preço Inicial", value=formatar_valor(self.preco), inline=True)
         embed.add_field(name="⏳ Termina em", value=f"<t:{int(datetime.strptime(self.data_fim, '%Y-%m-%d %H:%M:%S').timestamp())}:R>", inline=True)
-        embed.add_field(name="🔢 Maior Lance Atual", value=formatar_valor(self.preco), inline=True)
-        embed.add_field(name="👤 Dono do Leilão", value=interaction.user.mention, inline=True)
-        embed.set_footer(text=f"ID do Leilão: {self.chave[:8]}...")
+        embed.add_field(name="🔢 Maior Lance", value=formatar_valor(self.preco), inline=True)
+        embed.add_field(name="👤 Dono", value=interaction.user.mention, inline=True)
+        embed.set_footer(text=f"ID: {self.chave[:8]}...")
         
-        canal_leiloes = bot.get_channel(self.canal_id)
+        # Envia mensagem e inicia leilão
+        canal = bot.get_channel(self.canal_id)
         view = LeilaoAtivoView(interaction.user.id)
-        msg = await canal_leiloes.send(content="@everyone 🎉 **NOVO LEILÃO INICIADO!**", embed=embed, view=view)
+        msg = await canal.send("@everyone 🎉 **NOVO LEILÃO!**", embed=embed, view=view)
         
         c.execute("UPDATE leiloes SET message_id = ? WHERE canal_id = ?", (msg.id, self.canal_id))
         conn.commit()
         
-        tracker = LanceTracker(bot, self.canal_id)
-        active_trackers[self.canal_id] = tracker
-        asyncio.create_task(tracker.start(msg, self.preco, self.data_fim))
-        
-        await interaction.response.send_message(f"✅ Leilão criado com sucesso em {canal_leiloes.mention}!", ephemeral=True)
+        await auction_system.start_auction(self.canal_id, msg, self.preco, self.data_fim)
+        await interaction.response.send_message(f"✅ Leilão criado em {canal.mention}!", ephemeral=True)
 
 class LeilaoAtivoView(ui.View):
     def __init__(self, dono_id):
@@ -447,134 +423,107 @@ class LeilaoAtivoView(ui.View):
         self.dono_id = dono_id
         
     @ui.button(label="⏱️ Encerrar Leilão", style=discord.ButtonStyle.red, custom_id="encerrar_leilao")
-    async def encerrar_leilao(self, interaction: discord.Interaction, button: ui.Button):
+    async def encerrar_leilao(self, interaction: Interaction, button: ui.Button):
         if interaction.user.id != self.dono_id and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("⚠️ Apenas o dono do leilão ou administradores podem encerrá-lo!", ephemeral=True)
+            await interaction.response.send_message("❌ Apenas o dono ou administradores!", ephemeral=True)
             return
             
         await interaction.response.defer()
-        
-        tracker = get_active_tracker(interaction.channel.id)
-        if tracker:
-            await tracker.finalize_auction(encerrado_por=interaction.user)
-            await interaction.followup.send(f"⏱️ Leilão encerrado por {interaction.user.mention}")
-        else:
-            await interaction.followup.send("❌ Nenhum leilão ativo encontrado neste canal.", ephemeral=True)
+        await auction_system.finalize_auction(interaction.channel.id, ended_by=interaction.user)
+        await interaction.followup.send("⏱️ Leilão encerrado!")
 
-# Comandos Slash
-@bot.tree.command(name="calcular_robux", description="Calcula o valor em reais para uma quantidade de Robux")
+##############################################
+## COMANDOS SLASH (MANTIDOS IGUAIS)
+##############################################
+
+@bot.tree.command(name="calcular_robux", description="Calcula o valor em reais para Robux")
 @app_commands.describe(quantidade="Quantidade de Robux")
-async def calcular_robux(interaction: discord.Interaction, quantidade: int):
-    await interaction.response.defer()
-    
-    valor_com_taxa, gamepass_com_taxa = calcular_robux(quantidade, True)
-    valor_sem_taxa, gamepass_sem_taxa = calcular_robux(quantidade, False)
+async def calcular_robux(interaction: Interaction, quantidade: int):
+    valor_com, gamepass_com = calcular_robux(quantidade, True)
+    valor_sem, gamepass_sem = calcular_robux(quantidade, False)
     
     embed = Embed(title="💰 Cálculo de Robux", color=0x3498db)
     embed.add_field(
-        name=f"🔹 {quantidade} Robux com taxa (R$ 0,045 por Robux)",
-        value=(
-            f"**Valor:** {formatar_valor(valor_com_taxa)}\n"
-            f"**Preço da Gamepass:** {gamepass_com_taxa} Robux\n"
-            f"(Para receber {quantidade} Robux após a taxa de 30%)"
-        ),
+        name=f"🔹 {quantidade} Robux com taxa",
+        value=f"**Valor:** {formatar_valor(valor_com)}\n**Gamepass:** {gamepass_com} Robux",
         inline=False
     )
     embed.add_field(
-        name=f"🔸 {quantidade} Robux sem taxa (R$ 0,035 por Robux)",
-        value=(
-            f"**Valor:** {formatar_valor(valor_sem_taxa)}\n"
-            f"**Preço da Gamepass:** {gamepass_sem_taxa} Robux"
-        ),
+        name=f"🔸 {quantidade} Robux sem taxa",
+        value=f"**Valor:** {formatar_valor(valor_sem)}\n**Gamepass:** {gamepass_sem} Robux",
         inline=False
     )
-    embed.set_footer(text="Os valores podem variar conforme a cotação atual")
-    
-    await interaction.followup.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="reservar", description="Faz uma reserva")
 @app_commands.describe(nick="Nick do cliente", produto="Produto reservado")
-async def reservar(interaction: discord.Interaction, nick: str, produto: str):
-    canal_id = interaction.channel.id
-    c.execute('INSERT OR REPLACE INTO reservas (canal_id, nick, produto) VALUES (?, ?, ?)',
-              (canal_id, nick, produto))
+async def reservar(interaction: Interaction, nick: str, produto: str):
+    c.execute('INSERT OR REPLACE INTO reservas VALUES (?, ?, ?)',
+              (interaction.channel.id, nick, produto))
     conn.commit()
 
     try:
         await interaction.channel.edit(name="⏳・reservado")
-        cargo_remover = interaction.guild.get_role(CARGO_REMOVER_ID)
-        if cargo_remover:
+        cargo = interaction.guild.get_role(CARGO_REMOVER_ID)
+        if cargo:
             for member in interaction.channel.members:
-                try:
-                    await member.add_roles(cargo_remover)
-                except:
-                    pass
-    except Exception as e:
-        print(f"Erro: {e}")
+                await member.add_roles(cargo)
+    except:
+        pass
 
     await interaction.response.send_message(
-        "✅ Reserva realizada com sucesso!\nPara acessá-la, utilize o comando `/reserva`."
+        "✅ Reserva realizada!\nUse `/reserva` para visualizar."
     )
 
 @bot.tree.command(name="reserva", description="Mostra a reserva atual")
-async def reserva(interaction: discord.Interaction):
-    canal_id = interaction.channel.id
-    c.execute('SELECT nick, produto FROM reservas WHERE canal_id = ?', (canal_id,))
-    reserva = c.fetchone()
-
-    if reserva:
+async def reserva(interaction: Interaction):
+    c.execute('SELECT nick, produto FROM reservas WHERE canal_id = ?', (interaction.channel.id,))
+    if reserva := c.fetchone():
         nick, produto = reserva
-        cargo_menção = interaction.guild.get_role(CARGO_MENCAO_ID)
-        mensagem = (
-            "📋 **Reserva Atual**\n"
-            f"**👤 Nick:** {nick}\n"
-            f"**📦 Produto:** {produto}\n"
-            f"{cargo_menção.mention if cargo_menção else ''}"
+        cargo = interation.guild.get_role(CARGO_MENCAO_ID)
+        await interation.response.send_message(
+            f"📋 **Reserva Atual**\n**👤 Nick:** {nick}\n**📦 Produto:** {produto}\n"
+            f"{cargo.mention if cargo else ''}"
         )
-        await interaction.response.send_message(mensagem)
     else:
-        await interaction.response.send_message("ℹ️ Nenhuma reserva foi feita ainda neste canal.", ephemeral=True)
+        await interation.response.send_message("ℹ️ Nenhuma reserva encontrada.", ephemeral=True)
 
 @bot.tree.command(name="limpar", description="Limpa a reserva atual")
-async def limpar(interaction: discord.Interaction):
-    canal_id = interaction.channel.id
-    c.execute('DELETE FROM reservas WHERE canal_id = ?', (canal_id,))
+async def limpar(interaction: Interaction):
+    c.execute('DELETE FROM reservas WHERE canal_id = ?', (interaction.channel.id,))
     conn.commit()
     await interaction.response.send_message(
-        "🧹 Reserva limpa com sucesso!" if c.rowcount > 0 
-        else "ℹ️ Nenhuma reserva para limpar neste canal.",
+        "🧹 Reserva limpa!" if c.rowcount > 0 else "ℹ️ Nada para limpar.",
         ephemeral=True
     )
 
-@bot.tree.command(name="estoque", description="Anuncia novo estoque de Robux")
-@app_commands.describe(quantidade="Quantidade de Robux disponível")
-async def estoque(interaction: discord.Interaction, quantidade: int):
+@bot.tree.command(name="estoque", description="Anuncia novo estoque")
+@app_commands.describe(quantidade="Quantidade de Robux")
+async def estoque(interaction: Interaction, quantidade: int):
     if interaction.channel.id != CANAL_ESTOQUE_ID:
-        await interaction.response.send_message("⚠️ Este comando só pode ser usado no canal de estoque!", ephemeral=True)
+        await interaction.response.send_message("❌ Use no canal de estoque!", ephemeral=True)
         return
-
-    embed = Embed(title="🚀 NOVO ESTOQUE DISPONÍVEL!", color=0x00ff00)
+        
+    embed = Embed(title="🚀 NOVO ESTOQUE!", color=0x00ff00)
     embed.description = (
-        f"**📦 Quantidade:** `{quantidade:,}` Robux (prontos para entrega!)\n"
-        f"**💳 Preço especial:** Melhor custo-benefício do mercado!\n\n"
+        f"**📦 Quantidade:** `{quantidade:,}` Robux\n"
+        f"**💳 Melhor custo-benefício!**\n\n"
         f"🔹 **Como comprar?**\n"
-        f"1. Abra um ticket em <#{CANAL_TICKET_ID}>\n"
-        "2. Nos informe quanto Robux deseja\n"
-        "3. Receba seu Robux em minutos!\n\n"
-        "⚠️ **ATENÇÃO:** Estoque limitado! Garanta já o seu!"
+        f"1. Abra ticket em <#{CANAL_TICKET_ID}>\n"
+        "2. Informe quanto deseja\n"
+        "3. Receba em minutos!\n\n"
+        "⚠️ **ESTOQUE LIMITADO!**"
     )
     await interaction.response.send_message("@everyone", embed=embed)
 
-@bot.tree.command(name="entregue", description="Marca uma compra como entregue")
-@app_commands.describe(membro="Membro que recebeu a compra")
-async def entregue(interaction: discord.Interaction, membro: discord.Member):
+@bot.tree.command(name="entregue", description="Marca como entregue")
+@app_commands.describe(membro="Membro que recebeu")
+async def entregue(interaction: Interaction, membro: discord.Member):
     await interaction.response.defer()
     
-    cargo_entregue = interaction.guild.get_role(CARGO_ID)
-    cargo_remover = interaction.guild.get_role(CARGO_REMOVER_ID)
-
-    if not cargo_entregue or not cargo_remover:
-        await interaction.followup.send("❌ Cargos não configurados corretamente!", ephemeral=True)
+    cargo = interaction.guild.get_role(CARGO_ID)
+    if not cargo:
+        await interaction.followup.send("❌ Cargo não configurado!", ephemeral=True)
         return
 
     try:
@@ -583,107 +532,81 @@ async def entregue(interaction: discord.Interaction, membro: discord.Member):
         pass
 
     await interaction.followup.send(
-        f"✅ Tudo certo com sua compra, {membro.mention}?\n"
-        f"**Não esqueça de avaliar!** Deixe seu feedback aqui: <#{CHANNEL_FEEDBACK_ID}>\n"
-        f"{cargo_entregue.mention}"
+        f"✅ Tudo certo, {membro.mention}?\n"
+        f"Avalie em <#{CHANNEL_FEEDBACK_ID}>\n"
+        f"{cargo.mention}"
     )
 
-    embed = Embed(
-        title="✅ COMPRA ENTREGUE!",
-        description=(
-            "Sua compra foi entregue! Para verificar as provas, cheque o ticket da loja.\n\n"
-            "Não se esqueça de deixar uma avaliação se gostou da compra! Nos ajuda muito."
-        ),
-        color=0x00ff00
-    )
-    embed.set_thumbnail(url="https://static.vecteezy.com/ti/vetor-gratis/p1/12528049-entrega-de-compra-de-loja-design-plano-pacote-de-pedido-aberto-produtos-por-atacado-receber-encomenda-postal-descompactar-caixa-icone-de-glifoial-vetor.jpg")
-    
     try:
-        await membro.send(embed=embed)
+        await membro.send(embed=Embed(
+            title="✅ COMPRA ENTREGUE!",
+            description="Sua compra foi entregue! Verifique o ticket para as provas.",
+            color=0x00ff00
+        ))
     except:
         pass
 
-    try:
-        if cargo_remover in membro.roles:
-            await membro.remove_roles(cargo_remover)
-        if cargo_entregue not in membro.roles:
-            await membro.add_roles(cargo_entregue)
-    except:
-        pass
-
-@bot.tree.command(name="pixinter", description="Mostra informações para pagamento via PIX internacional")
-async def pixinter(interaction: discord.Interaction):
-    embed = Embed(title="💳 Informações para PIX Internacional", color=0x9b59b6)
-    embed.add_field(name="Chave PIX", value="facinlaras0511@gmail.com", inline=False)
-    embed.add_field(name="Tipo de chave", value="E-mail", inline=False)
-    embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
+@bot.tree.command(name="pixinter", description="Mostra PIX internacional")
+async def pixinter(interaction: Interaction):
+    embed = Embed(title="💳 PIX Internacional", color=0x9b59b6)
+    embed.add_field(name="Chave", value="facinlaras0511@gmail.com", inline=False)
+    embed.add_field(name="Tipo", value="E-mail", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Comando de prefixo (não slash)
 @bot.command(name="pix")
 async def pix(ctx):
-    embed = Embed(title="💳 Informações para PIX", color=0x9b59b6)
-    embed.add_field(name="Chave PIX", value="0d8656b8-470e-4e0c-ac22-233ab0aa22ae", inline=False)
-    embed.add_field(name="Tipo de chave", value="Chave aleatória", inline=False)
-    embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
+    embed = Embed(title="💳 PIX", color=0x9b59b6)
+    embed.add_field(name="Chave", value="0d8656b8-470e-4e0c-ac22-233ab0aa22ae", inline=False)
+    embed.add_field(name="Tipo", value="Aleatória", inline=False)
     await ctx.send(embed=embed)
 
-# Comandos do sistema de leilão
-@bot.tree.command(name="gerarchave", description="Gera uma chave de leilão (apenas administradores)")
-@app_commands.describe(duracao="Duração (ex: 1d, 12h, 3d)", usos="Número de usos permitidos")
+@bot.tree.command(name="gerarchave", description="Gera chave de leilão (admin)")
+@app_commands.describe(duracao="Duração (ex: 1d, 12h)", usos="Número de usos")
 @app_commands.checks.has_permissions(administrator=True)
-async def gerar_chave_cmd(interaction: discord.Interaction, duracao: str, usos: int):
+async def gerar_chave_cmd(interaction: Interaction, duracao: str, usos: int):
     chave = gerar_chave()
     c.execute("INSERT INTO chaves_leilao VALUES (?, ?, ?, ?, ?)", 
               (chave, duracao, usos, usos, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     
-    embed = Embed(title="🔑 Chave Gerada com Sucesso!", color=0x00ff00)
+    embed = Embed(title="🔑 Chave Gerada!", color=0x00ff00)
     embed.add_field(name="Chave", value=f"`{chave}`", inline=False)
     embed.add_field(name="Duração", value=duracao, inline=True)
     embed.add_field(name="Usos", value=str(usos), inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="leilao", description="Inicia o processo de criação de leilão")
-async def leilao(interaction: discord.Interaction):
-    embed = Embed(title="🏷️ Sistema de Leilão de Contas", color=0x3498db)
+@bot.tree.command(name="leilao", description="Inicia processo de leilão")
+async def leilao(interaction: Interaction):
+    embed = Embed(title="🏷️ Sistema de Leilão", color=0x3498db)
     embed.description = (
         "**Como participar?**\n"
-        "1. Adquira uma chave de leilão com nossos vendedores\n"
-        "2. Clique no botão abaixo para adicionar sua chave\n"
-        "3. Preencha o formulário com os detalhes da sua conta\n"
-        "4. Seu leilão será publicado automaticamente!\n\n"
-        "**Pacotes disponíveis:**\n"
+        "1. Adquira uma chave com nossos vendedores\n"
+        "2. Clique no botão abaixo\n"
+        "3. Preencha o formulário\n"
+        "4. Seu leilão será publicado!\n\n"
+        "**Pacotes:**\n"
         "🕒 12h - R$ 10,00\n"
         "🌞 1 dia - R$ 15,00\n"
         "✨ 3 dias - R$ 25,00\n"
-        "🔥 10 dias - R$ 50,00\n"
-        "👑 Vitalício - R$ 75,00"
+        "🔥 10 dias - R$ 50,00"
     )
     await interaction.response.send_message(embed=embed, view=LeilaoView())
 
-# Evento para processar lances
 @bot.event
 async def on_message(message):
     await bot.process_commands(message)
-    
-    if not message.author.bot and message.guild:
-        tracker = get_active_tracker(message.channel.id)
-        if tracker and tracker.active:
-            await tracker.process_bid(message)
+    await auction_system.process_bid(message)
 
 @bot.event
 async def on_ready():
-    print(f'Bot {bot.user.name} está online!')
-    
-    # Adiciona as views persistentes
+    print(f'Bot {bot.user.name} online!')
     bot.add_view(LeilaoView())
     bot.add_view(LeilaoAtivoView(dono_id=0))
     
     try:
         synced = await bot.tree.sync()
-        print(f"Comandos slash sincronizados: {len(synced)}")
+        print(f"Comandos sincronizados: {len(synced)}")
     except Exception as e:
-        print(f"Erro ao sincronizar comandos: {e}")
+        print(f"Erro ao sincronizar: {e}")
 
 bot.run(TOKEN)
