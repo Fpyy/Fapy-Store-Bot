@@ -39,6 +39,7 @@ CANAIS_LEILAO = [1354935337398436040, 1354935389584097440]
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Conexão com o banco de dados
@@ -460,6 +461,207 @@ class LeilaoAtivoView(ui.View):
         else:
             await interaction.followup.send("❌ Nenhum leilão ativo encontrado neste canal.", ephemeral=True)
 
+# Comandos Slash
+@bot.tree.command(name="calcular_robux", description="Calcula o valor em reais para uma quantidade de Robux")
+@app_commands.describe(quantidade="Quantidade de Robux")
+async def calcular_robux(interaction: discord.Interaction, quantidade: int):
+    await interaction.response.defer()
+    
+    valor_com_taxa, gamepass_com_taxa = calcular_robux(quantidade, True)
+    valor_sem_taxa, gamepass_sem_taxa = calcular_robux(quantidade, False)
+    
+    embed = Embed(title="💰 Cálculo de Robux", color=0x3498db)
+    embed.add_field(
+        name=f"🔹 {quantidade} Robux com taxa (R$ 0,045 por Robux)",
+        value=(
+            f"**Valor:** {formatar_valor(valor_com_taxa)}\n"
+            f"**Preço da Gamepass:** {gamepass_com_taxa} Robux\n"
+            f"(Para receber {quantidade} Robux após a taxa de 30%)"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name=f"🔸 {quantidade} Robux sem taxa (R$ 0,035 por Robux)",
+        value=(
+            f"**Valor:** {formatar_valor(valor_sem_taxa)}\n"
+            f"**Preço da Gamepass:** {gamepass_sem_taxa} Robux"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Os valores podem variar conforme a cotação atual")
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="reservar", description="Faz uma reserva")
+@app_commands.describe(nick="Nick do cliente", produto="Produto reservado")
+async def reservar(interaction: discord.Interaction, nick: str, produto: str):
+    canal_id = interaction.channel.id
+    c.execute('INSERT OR REPLACE INTO reservas (canal_id, nick, produto) VALUES (?, ?, ?)',
+              (canal_id, nick, produto))
+    conn.commit()
+
+    try:
+        await interaction.channel.edit(name="⏳・reservado")
+        cargo_remover = interaction.guild.get_role(CARGO_REMOVER_ID)
+        if cargo_remover:
+            for member in interaction.channel.members:
+                try:
+                    await member.add_roles(cargo_remover)
+                except:
+                    pass
+    except Exception as e:
+        print(f"Erro: {e}")
+
+    await interaction.response.send_message(
+        "✅ Reserva realizada com sucesso!\nPara acessá-la, utilize o comando `/reserva`."
+    )
+
+@bot.tree.command(name="reserva", description="Mostra a reserva atual")
+async def reserva(interaction: discord.Interaction):
+    canal_id = interaction.channel.id
+    c.execute('SELECT nick, produto FROM reservas WHERE canal_id = ?', (canal_id,))
+    reserva = c.fetchone()
+
+    if reserva:
+        nick, produto = reserva
+        cargo_menção = interaction.guild.get_role(CARGO_MENCAO_ID)
+        mensagem = (
+            "📋 **Reserva Atual**\n"
+            f"**👤 Nick:** {nick}\n"
+            f"**📦 Produto:** {produto}\n"
+            f"{cargo_menção.mention if cargo_menção else ''}"
+        )
+        await interaction.response.send_message(mensagem)
+    else:
+        await interaction.response.send_message("ℹ️ Nenhuma reserva foi feita ainda neste canal.", ephemeral=True)
+
+@bot.tree.command(name="limpar", description="Limpa a reserva atual")
+async def limpar(interaction: discord.Interaction):
+    canal_id = interaction.channel.id
+    c.execute('DELETE FROM reservas WHERE canal_id = ?', (canal_id,))
+    conn.commit()
+    await interaction.response.send_message(
+        "🧹 Reserva limpa com sucesso!" if c.rowcount > 0 
+        else "ℹ️ Nenhuma reserva para limpar neste canal.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="estoque", description="Anuncia novo estoque de Robux")
+@app_commands.describe(quantidade="Quantidade de Robux disponível")
+async def estoque(interaction: discord.Interaction, quantidade: int):
+    if interaction.channel.id != CANAL_ESTOQUE_ID:
+        await interaction.response.send_message("⚠️ Este comando só pode ser usado no canal de estoque!", ephemeral=True)
+        return
+
+    embed = Embed(title="🚀 NOVO ESTOQUE DISPONÍVEL!", color=0x00ff00)
+    embed.description = (
+        f"**📦 Quantidade:** `{quantidade:,}` Robux (prontos para entrega!)\n"
+        f"**💳 Preço especial:** Melhor custo-benefício do mercado!\n\n"
+        f"🔹 **Como comprar?**\n"
+        f"1. Abra um ticket em <#{CANAL_TICKET_ID}>\n"
+        "2. Nos informe quanto Robux deseja\n"
+        "3. Receba seu Robux em minutos!\n\n"
+        "⚠️ **ATENÇÃO:** Estoque limitado! Garanta já o seu!"
+    )
+    await interaction.response.send_message("@everyone", embed=embed)
+
+@bot.tree.command(name="entregue", description="Marca uma compra como entregue")
+@app_commands.describe(membro="Membro que recebeu a compra")
+async def entregue(interaction: discord.Interaction, membro: discord.Member):
+    await interaction.response.defer()
+    
+    cargo_entregue = interaction.guild.get_role(CARGO_ID)
+    cargo_remover = interaction.guild.get_role(CARGO_REMOVER_ID)
+
+    if not cargo_entregue or not cargo_remover:
+        await interaction.followup.send("❌ Cargos não configurados corretamente!", ephemeral=True)
+        return
+
+    try:
+        await interaction.channel.edit(name="✅・entregue")
+    except:
+        pass
+
+    await interaction.followup.send(
+        f"✅ Tudo certo com sua compra, {membro.mention}?\n"
+        f"**Não esqueça de avaliar!** Deixe seu feedback aqui: <#{CHANNEL_FEEDBACK_ID}>\n"
+        f"{cargo_entregue.mention}"
+    )
+
+    embed = Embed(
+        title="✅ COMPRA ENTREGUE!",
+        description=(
+            "Sua compra foi entregue! Para verificar as provas, cheque o ticket da loja.\n\n"
+            "Não se esqueça de deixar uma avaliação se gostou da compra! Nos ajuda muito."
+        ),
+        color=0x00ff00
+    )
+    embed.set_thumbnail(url="https://static.vecteezy.com/ti/vetor-gratis/p1/12528049-entrega-de-compra-de-loja-design-plano-pacote-de-pedido-aberto-produtos-por-atacado-receber-encomenda-postal-descompactar-caixa-icone-de-glifoial-vetor.jpg")
+    
+    try:
+        await membro.send(embed=embed)
+    except:
+        pass
+
+    try:
+        if cargo_remover in membro.roles:
+            await membro.remove_roles(cargo_remover)
+        if cargo_entregue not in membro.roles:
+            await membro.add_roles(cargo_entregue)
+    except:
+        pass
+
+@bot.tree.command(name="pixinter", description="Mostra informações para pagamento via PIX internacional")
+async def pixinter(interaction: discord.Interaction):
+    embed = Embed(title="💳 Informações para PIX Internacional", color=0x9b59b6)
+    embed.add_field(name="Chave PIX", value="facinlaras0511@gmail.com", inline=False)
+    embed.add_field(name="Tipo de chave", value="E-mail", inline=False)
+    embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# Comando de prefixo (não slash)
+@bot.command(name="pix")
+async def pix(ctx):
+    embed = Embed(title="💳 Informações para PIX", color=0x9b59b6)
+    embed.add_field(name="Chave PIX", value="0d8656b8-470e-4e0c-ac22-233ab0aa22ae", inline=False)
+    embed.add_field(name="Tipo de chave", value="Chave aleatória", inline=False)
+    embed.add_field(name="Instruções", value="Envie o valor exato da compra e o comprovante para o atendente", inline=False)
+    await ctx.send(embed=embed)
+
+# Comandos do sistema de leilão
+@bot.tree.command(name="gerarchave", description="Gera uma chave de leilão (apenas administradores)")
+@app_commands.describe(duracao="Duração (ex: 1d, 12h, 3d)", usos="Número de usos permitidos")
+@app_commands.checks.has_permissions(administrator=True)
+async def gerar_chave_cmd(interaction: discord.Interaction, duracao: str, usos: int):
+    chave = gerar_chave()
+    c.execute("INSERT INTO chaves_leilao VALUES (?, ?, ?, ?, ?)", 
+              (chave, duracao, usos, usos, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    
+    embed = Embed(title="🔑 Chave Gerada com Sucesso!", color=0x00ff00)
+    embed.add_field(name="Chave", value=f"`{chave}`", inline=False)
+    embed.add_field(name="Duração", value=duracao, inline=True)
+    embed.add_field(name="Usos", value=str(usos), inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="leilao", description="Inicia o processo de criação de leilão")
+async def leilao(interaction: discord.Interaction):
+    embed = Embed(title="🏷️ Sistema de Leilão de Contas", color=0x3498db)
+    embed.description = (
+        "**Como participar?**\n"
+        "1. Adquira uma chave de leilão com nossos vendedores\n"
+        "2. Clique no botão abaixo para adicionar sua chave\n"
+        "3. Preencha o formulário com os detalhes da sua conta\n"
+        "4. Seu leilão será publicado automaticamente!\n\n"
+        "**Pacotes disponíveis:**\n"
+        "🕒 12h - R$ 10,00\n"
+        "🌞 1 dia - R$ 15,00\n"
+        "✨ 3 dias - R$ 25,00\n"
+        "🔥 10 dias - R$ 50,00\n"
+        "👑 Vitalício - R$ 75,00"
+    )
+    await interaction.response.send_message(embed=embed, view=LeilaoView())
+
 # Evento para processar lances
 @bot.event
 async def on_message(message):
@@ -470,13 +672,14 @@ async def on_message(message):
         if tracker and tracker.active:
             await tracker.process_bid(message)
 
-# [RESTANTE DOS COMANDOS SLASH E EVENTOS MANTIDOS IGUAL AO CÓDIGO ANTERIOR]
-
 @bot.event
 async def on_ready():
     print(f'Bot {bot.user.name} está online!')
+    
+    # Adiciona as views persistentes
     bot.add_view(LeilaoView())
     bot.add_view(LeilaoAtivoView(dono_id=0))
+    
     try:
         synced = await bot.tree.sync()
         print(f"Comandos slash sincronizados: {len(synced)}")
