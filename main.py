@@ -108,8 +108,8 @@ class LeilaoView(ui.View):
             c.execute("SELECT ultimo_uso FROM cooldown_chaves WHERE user_id = ?", (interaction.user.id,))
             cooldown = c.fetchone()
             
-            if cooldown and (datetime.now() - datetime.strptime(cooldown[0], "%Y-%m-%d %H:%M:%S")) < timedelta(days=2):
-                await interaction.response.send_message("⏳ Aguarde 2 dias entre usos de chaves!", ephemeral=True)
+            if cooldown and (datetime.now() - datetime.strptime(cooldown[0], "%Y-%m-%d %H:%M:%S")) < timedelta(hours=1):
+                await interaction.response.send_message("⏳ Aguarde 1 hora entre usos de chaves!", ephemeral=True)
                 return
                 
         await interaction.response.send_modal(AdicionarChaveModal())
