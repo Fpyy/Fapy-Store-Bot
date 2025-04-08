@@ -4,6 +4,7 @@ import random
 import string
 from datetime import datetime, timedelta
 import asyncio
+import aiohttp
 from flask import Flask
 from threading import Thread
 import discord
@@ -36,6 +37,7 @@ CANAL_ESTOQUE_ID = 1354545783948579057
 CANAL_TICKET_ID = 1340344478707224728
 CANAIS_LEILAO = [1356427244171563089, 1354935389584097440]
 TEMPO_LIMPEZA_LEILAO = 5 * 60  # 5 minutos em segundos
+WEBHOOK_LEILAO_LOGS = "https://discord.com/api/webhooks/1358932314012389669/wdA0qeOI5O7r5joS0V18DFNnRt7paYqo0jRq4UxMl2XiZdFbLeWn8c7e1xBD0X6EhStu"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -84,7 +86,6 @@ def gerar_chave():
 def formatar_valor(valor):
     return f"R$ {valor:,.2f}".replace('.', 'temp').replace(',', '.').replace('temp', ',')
 
-# Renomeei a função para evitar conflito com o comando
 def calcular_valor_robux(quantidade, com_taxa):
     if com_taxa:
         valor = (quantidade / 1000) * 45.00
@@ -94,8 +95,17 @@ def calcular_valor_robux(quantidade, com_taxa):
         gamepass = quantidade
     return valor, gamepass
 
+async def enviar_log_leilao(mensagem: str):
+    """Envia logs para o webhook de leilões"""
+    async with aiohttp.ClientSession() as session:
+        webhook = discord.Webhook.from_url(WEBHOOK_LEILAO_LOGS, session=session)
+        try:
+            await webhook.send(mensagem)
+        except Exception as e:
+            print(f"Erro ao enviar log: {e}")
+
 ##############################################
-## CLASSES DE VIEW PRIMEIRO
+## CLASSES DE VIEW
 ##############################################
 
 class LeilaoView(ui.View):
@@ -244,6 +254,18 @@ class ConfirmarLeilaoView(ui.View):
         conn.commit()
         
         await auction_system.start_auction(self.canal_id, msg, self.preco, self.data_fim)
+        
+        # Log de início de leilão
+        log_msg = (
+            f"🎉 **NOVO LEILÃO INICIADO**\n"
+            f"📌 **Conta:** {self.nome}\n"
+            f"👤 **Dono:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+            f"💰 **Preço inicial:** {formatar_valor(self.preco)}\n"
+            f"⏳ **Duração:** {self.chave_info[1]}\n"
+            f"🔗 [Ir para o leilão]({msg.jump_url})"
+        )
+        await enviar_log_leilao(log_msg)
+        
         await interaction.response.send_message(f"✅ Leilão criado em {canal.mention}!", ephemeral=True)
 
 class LeilaoAtivoView(ui.View):
@@ -270,6 +292,7 @@ class AuctionSystem:
         self.bot = bot
         self.active_auctions = {}
         self.cleanup_tasks = {}
+        self.lances_historico = {}  # {channel_id: [{"user": user, "valor": float, "msg_id": int}]}
         
     async def start_auction(self, channel_id, message, preco_inicial, data_fim):
         """Inicia um novo leilão"""
@@ -283,6 +306,7 @@ class AuctionSystem:
             'all_messages': [message.id]
         }
         
+        self.lances_historico[channel_id] = []
         self.bot.loop.create_task(self._check_auction_end(channel_id))
         
     async def _check_auction_end(self, channel_id):
@@ -349,6 +373,15 @@ class AuctionSystem:
                 auction['all_messages'].append(error_msg.id)
                 return
                 
+            # Registra o lance no histórico
+            self.lances_historico[channel_id].append({
+                "user": message.author,
+                "valor": bid_amount,
+                "msg_id": message.id,
+                "timestamp": datetime.now()
+            })
+
+            # Atualiza o maior lance
             auction['current_bid'] = bid_amount
             auction['current_winner'] = message.author
             
@@ -361,6 +394,17 @@ class AuctionSystem:
             
             await self._update_auction_message(channel_id)
             await message.add_reaction("✅")
+            
+            # Envia log do lance
+            log_msg = (
+                f"📌 **NOVO LANCE**\n"
+                f"👤 **Usuário:** {message.author.mention} (`{message.author.id}`)\n"
+                f"💰 **Valor:** {formatar_valor(bid_amount)}\n"
+                f"📅 **Horário:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"🔗 [Mensagem]({message.jump_url})"
+            )
+            await enviar_log_leilao(log_msg)
+            
             notification = await message.channel.send(
                 f"🎉 {message.author.mention} ofereceu {formatar_valor(bid_amount)}!",
                 delete_after=10
@@ -445,6 +489,16 @@ class AuctionSystem:
         if auction['message']:
             await auction['message'].edit(content="🔔 LEILÃO ENCERRADO! @everyone", view=None)
         
+        # Log de finalização
+        log_msg = (
+            f"🏁 **LEILÃO FINALIZADO**\n"
+            f"📌 **Conta:** {nome_conta}\n"
+            f"🏆 **Vencedor:** <@{vencedor_id}> (R$ {maior_lance:.2f})\n"
+            f"⏳ **Motivo:** {motivo}\n"
+            f"🔗 **ID do Leilão:** `{chave[:8]}...`"
+        )
+        await enviar_log_leilao(log_msg)
+        
         if vencedor_id:
             try:
                 user = await self.bot.fetch_user(vencedor_id)
@@ -495,9 +549,8 @@ auction_system = AuctionSystem(bot)
 @bot.tree.command(name="calcular_robux", description="Calcula o valor em reais para Robux")
 @app_commands.describe(quantidade="Quantidade de Robux")
 async def calcular_robux(interaction: Interaction, quantidade: int):
-    await interaction.response.defer()  # Adiciona defer para evitar timeout
+    await interaction.response.defer()
     
-    # Usa a função renomeada
     valor_com, gamepass_com = calcular_valor_robux(quantidade, True)
     valor_sem, gamepass_sem = calcular_valor_robux(quantidade, False)
     
@@ -652,6 +705,7 @@ async def leilao(interaction: Interaction):
         "2. Clique no botão abaixo\n"
         "3. Preencha o formulário\n"
         "4. Seu leilão será publicado!\n\n"
+        "⏱️ **Cooldown:** 1 hora entre usos\n\n"
         "**Pacotes:**\n"
         "🕒 12h - R$ 10,00\n"
         "🌞 1 dia - R$ 15,00\n"
@@ -666,6 +720,49 @@ async def on_message(message):
     
     if message.channel.id in auction_system.active_auctions:
         await auction_system.process_bid(message)
+
+@bot.event
+async def on_message_delete(message):
+    """Verifica se uma mensagem apagada era um lance válido e restaura o anterior"""
+    channel_id = message.channel.id
+    
+    # Verifica se a mensagem era um lance em um leilão ativo
+    if channel_id in auction_system.lances_historico:
+        lances = auction_system.lances_historico[channel_id]
+        lance_apagado = next((lance for lance in lances if lance["msg_id"] == message.id), None)
+        
+        if lance_apagado:
+            # Remove o lance apagado do histórico
+            lances.remove(lance_apagado)
+            
+            # Pega o último lance válido (se houver)
+            if lances:
+                ultimo_lance = lances[-1]
+                auction = auction_system.active_auctions.get(channel_id)
+                
+                if auction:
+                    # Restaura o lance anterior
+                    auction['current_bid'] = ultimo_lance["valor"]
+                    auction['current_winner'] = ultimo_lance["user"]
+                    
+                    c.execute("""
+                        UPDATE leiloes 
+                        SET maior_lance = ?, maior_lance_user = ? 
+                        WHERE canal_id = ?
+                    """, (ultimo_lance["valor"], ultimo_lance["user"].id, channel_id))
+                    conn.commit()
+                    
+                    await auction_system._update_auction_message(channel_id)
+                    
+                    # Envia log de restauração
+                    log_msg = (
+                        f"❌ **LANCE APAGADO**\n"
+                        f"👤 **Usuário:** {message.author.mention} (`{message.author.id}`)\n"
+                        f"💸 **Valor removido:** {formatar_valor(lance_apagado['valor'])}\n"
+                        f"🔙 **Lance restaurado:** {formatar_valor(ultimo_lance['valor'])} (por {ultimo_lance['user'].mention})\n"
+                        f"📅 **Horário:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+                    )
+                    await enviar_log_leilao(log_msg)
 
 @bot.event
 async def on_ready():
